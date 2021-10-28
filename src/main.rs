@@ -10,10 +10,11 @@ use actix_web::{guard, web, App, HttpServer};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use awc::Client;
+use cache_rpc::types::SemaphoreQueue;
 use either::Either;
 use lru::LruCache;
 use structopt::StructOpt;
-use tokio::sync::{watch, Notify, Semaphore};
+use tokio::sync::{watch, Notify};
 use tracing::info;
 use tracing_subscriber::fmt;
 
@@ -64,6 +65,18 @@ struct Options {
         help = "maximum number of concurrent getAccountInfo cache-to-validator requests"
     )]
     account_info_request_limit: usize,
+    #[structopt(
+        short = "A",
+        long = "account-request-queue-size",
+        help = "maximum number of getAccountInfo requests, that may be queued, if concurrent limit is reached"
+    )]
+    account_info_request_queue_size: Option<usize>,
+    #[structopt(
+        short = "P",
+        long = "program-request-queue-size",
+        help = "maximum number of getProgramAccounts requests, that may be queued, if concurrent limit is reached"
+    )]
+    program_accounts_request_queue_size: Option<usize>,
     #[structopt(
         short = "b",
         long = "body-cache-size",
@@ -192,11 +205,21 @@ impl Config {
     }
 
     fn from_options(options: &Options) -> Config {
+        let account_info_request_queue_size = options
+            .account_info_request_queue_size
+            .unwrap_or_else(|| options.account_info_request_limit * 2);
+        let program_accounts_request_queue_size = options
+            .account_info_request_queue_size
+            .unwrap_or_else(|| options.program_accounts_request_limit * 2);
         Config {
             rpc: rpc::Config {
                 request_limits: rpc::RequestLimits {
                     account_info: options.account_info_request_limit,
                     program_accounts: options.program_accounts_request_limit,
+                },
+                request_queue_size: rpc::RequestQueueSize {
+                    account_info: account_info_request_queue_size,
+                    program_accounts: program_accounts_request_queue_size,
                 },
                 ignore_base58_limit: options.ignore_base58,
             },
@@ -283,10 +306,14 @@ async fn run(options: Options) -> Result<()> {
 
     let rpc_url = options.rpc_url;
     let notify = Arc::new(Notify::new());
-    let account_info_request_limit =
-        Arc::new(Semaphore::new(config.rpc.request_limits.account_info));
-    let program_accounts_request_limit =
-        Arc::new(Semaphore::new(config.rpc.request_limits.program_accounts));
+    let account_info_request_limit = Arc::new(SemaphoreQueue::new(
+        config.rpc.request_queue_size.account_info,
+        config.rpc.request_limits.account_info,
+    ));
+    let program_accounts_request_limit = Arc::new(SemaphoreQueue::new(
+        config.rpc.request_queue_size.program_accounts,
+        config.rpc.request_limits.program_accounts,
+    ));
     let total_connection_limit =
         2 * (config.rpc.request_limits.account_info + config.rpc.request_limits.program_accounts);
     let body_cache_size = options.body_cache_size;
